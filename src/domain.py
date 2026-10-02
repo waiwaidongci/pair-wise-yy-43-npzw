@@ -34,5 +34,9 @@ def require_number(value,field,minimum=0.0):
     except (TypeError,ValueError): raise ValidationError(f"{field}必须是数字")
     if number<minimum: raise ValidationError(f"{field}不能小于{minimum}")
     return number
+def require_id(value,field):
+    if isinstance(value,bool) or not isinstance(value,int) or value<1:
+        raise ValidationError(f"{field}必须是正整数")
+    return value
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")

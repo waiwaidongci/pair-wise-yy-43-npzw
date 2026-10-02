@@ -89,6 +89,11 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"records": service.list_records(item_id, role)})
+                elif path.startswith("/api/items/") and path.endswith("/history"):
+                    item_id = int(path.split("/")[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.item_history(item_id, role))
                 elif path.startswith("/api/items/"):
                     item_id = int(path.rsplit("/", 1)[-1])
                     actor, role = self._identity()
@@ -98,6 +103,14 @@ def make_handler(service: Service, static_dir: str):
                     actor, role = self._identity()
                     del actor
                     self._json(200, {"events": service.audit(role)})
+                elif path.startswith("/api/merges/"):
+                    parts = [p for p in path.split("/") if p]
+                    primary_id = int(parts[2])
+                    subordinate_id = int(parts[3])
+                    actor, role = self._identity()
+                    del actor
+                    self._json(200, service.get_merge(
+                        primary_id, subordinate_id, role))
                 else:
                     self._json(404, {"error": "not_found"})
             except Exception as exc:
@@ -110,6 +123,13 @@ def make_handler(service: Service, static_dir: str):
                 body = self._body()
                 if path == "/api/items":
                     self._json(201, service.create_item(body, actor, role))
+                elif path == "/api/merges":
+                    self._json(200, service.merge(body, actor, role))
+                elif path.startswith("/api/merges/"):
+                    parts = [p for p in path.split("/") if p]
+                    primary_id = int(parts[2])
+                    subordinate_id = int(parts[3])
+                    self._json(200, service.get_merge(primary_id, subordinate_id, role))
                 elif path.startswith("/api/items/") and path.endswith("/records"):
                     item_id = int(path.split("/")[3])
                     self._json(201, service.add_record(item_id, body, actor, role))

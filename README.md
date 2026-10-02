@@ -30,9 +30,27 @@ python3 app.py --db ./data.db --port 8320
 - `GET /api/items/{id}`
 - `POST /api/items/{id}/records`
 - `POST /api/items/{id}/transition`，必须提交`expected_version`
+- `POST /api/merges`：事件归并，提交`primary_item_id`、`subordinate_item_id`及双方`*_expected_version`
+- `GET /api/merges/{primary_id}/{subordinate_id}`：查询已成立的归并关系
+- `GET /api/items/{id}/history`：从属事件的原状态、原记录编号和归并关系
 - `GET /api/audit`
 
 允许角色：observer, response_commander, operations, viewer。估算油量、海况和未完成任务数影响响应等级；关闭前必须完成回收和岸线监测记录。
+
+## 事件归并
+
+同一海域两起溢油被确认为同一起时，由指挥员（response_commander）提交主事件与从属事件，
+并同时给出双方当前版本；只有两边版本都未变化时归并才成立：
+
+- 从属事件的有效记录改归主事件，主/从两侧版本各加一，从属事件保留原状态并被冻结
+  （不能再登记记录或流转，状态由主事件延续）。
+- 现场单号（`external_ref`）相同的记录只保留最早登记的一条（以记录编号为准），
+  其余写入冲突清单，标记为`duplicate_conflict`并指向保留记录，不迁移、不计入未结事项。
+- 迁入主事件的未结记录继续挡住主事件关闭。
+- 同一组（主事件, 从属事件）并发提交只成立一笔；丢单的一方拿到当前归并关系
+  （响应带`"replayed": true`）。写入失败整体回滚，可按原请求重试；重复提交沿用首次结果。
+- 归并在主事件写`merge`审计事件、在从属事件写`merge_link`审计事件，二者共享`merge_id`，
+  详情含记录去向与冲突清单，可与主事件详情和`GET /api/items/{id}/history`相互对应。
 
 ## 测试
 
