@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
-from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .domain import ConflictError, NotFoundError, ValidationError
+from .rules import ENTITY, ID_PREFIX, STATES
 
 
 class Repository:
@@ -64,6 +64,19 @@ class Repository:
                     previous_hash TEXT NOT NULL,
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS merges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    primary_id INTEGER NOT NULL REFERENCES items(id),
+                    secondary_id INTEGER NOT NULL REFERENCES items(id),
+                    primary_version INTEGER NOT NULL,
+                    secondary_version INTEGER NOT NULL,
+                    moved_records TEXT NOT NULL DEFAULT '[]',
+                    conflict_records TEXT NOT NULL DEFAULT '[]',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(primary_id, secondary_id),
+                    UNIQUE(secondary_id)
                 );
             """)
 
@@ -156,6 +169,183 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def _get_merge_locked(self, primary_id: int, secondary_id: int) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT * FROM merges WHERE primary_id=? AND secondary_id=?",
+            (primary_id, secondary_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._merge_row(row)
+
+    def _is_secondary_locked(self, item_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM merges WHERE secondary_id=? LIMIT 1", (item_id,)
+        ).fetchone()
+        return row is not None
+
+    def _list_records_locked(self, item_id: int) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            "SELECT * FROM records WHERE item_id=? ORDER BY id", (item_id,)
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _merge_row(row: sqlite3.Row) -> Dict[str, Any]:
+        d = dict(row)
+        d["moved_records"] = json.loads(d["moved_records"])
+        d["conflict_records"] = json.loads(d["conflict_records"])
+        return d
+
+    @staticmethod
+    def _conflict_entry(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "record_id": record["id"],
+            "kind": record["kind"],
+            "external_ref": record["external_ref"],
+            "detail": record["detail"],
+            "status": record["status"],
+            "created_by": record["created_by"],
+            "created_at": record["created_at"],
+            "reason": "external_ref_duplicate",
+        }
+
+    @staticmethod
+    def _dedupe_records(primary_records: List[Dict[str, Any]],
+                        secondary_records: List[Dict[str, Any]]
+                        ) -> tuple:
+        primary_refs = {
+            r["external_ref"]: r for r in primary_records
+            if r["external_ref"] is not None
+        }
+        moved: List[Dict[str, Any]] = []
+        conflicts: List[Dict[str, Any]] = []
+        groups: Dict[Any, List[Dict[str, Any]]] = {}
+        for r in secondary_records:
+            if r["external_ref"] is None:
+                moved.append(r)
+            else:
+                groups.setdefault(r["external_ref"], []).append(r)
+        for ref, recs in groups.items():
+            if ref in primary_refs:
+                for r in recs:
+                    conflicts.append(Repository._conflict_entry(r))
+                continue
+            ordered = sorted(recs, key=lambda r: (r["created_at"], r["id"]))
+            moved.append(ordered[0])
+            for r in ordered[1:]:
+                conflicts.append(Repository._conflict_entry(r))
+        return moved, conflicts
+
+    def _append_audit_in_tx(self, action: str, entity_type: str, entity_id: int,
+                            actor: str, detail: dict) -> Dict[str, Any]:
+        row = self.conn.execute(
+            "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous = row["entry_hash"] if row else "GENESIS"
+        event = make_entry(action, entity_type, entity_id, actor, detail, previous)
+        cur = self.conn.execute(
+            """INSERT INTO audit_events(action, entity_type, entity_id, actor, detail,
+               previous_hash, entry_hash, created_at) VALUES(?,?,?,?,?,?,?,?)""",
+            (event["action"], event["entity_type"], event["entity_id"], event["actor"],
+             json.dumps(event["detail"], ensure_ascii=False, sort_keys=True),
+             event["previous_hash"], event["entry_hash"], event["created_at"]),
+        )
+        event["id"] = int(cur.lastrowid)
+        return event
+
+    def merge_items(self, primary_id: int, secondary_id: int,
+                    primary_version: int, secondary_version: int, actor: str
+                    ) -> tuple:
+        now = utc_now()
+        with self._lock, self.conn:
+            existing = self._get_merge_locked(primary_id, secondary_id)
+            if existing is not None:
+                return existing, False
+            primary = self.get_item(primary_id)
+            secondary = self.get_item(secondary_id)
+            if primary_id == secondary_id:
+                raise ValidationError("主事件和从属事件不能相同")
+            if self._is_secondary_locked(primary_id):
+                raise ConflictError("主事件已被归并，不能作为主事件")
+            if self._is_secondary_locked(secondary_id):
+                raise ConflictError("从属事件已被归并，不能重复归并")
+            if primary["version"] != primary_version or secondary["version"] != secondary_version:
+                raise ConflictError("版本冲突，请刷新后重试")
+            primary_records = self._list_records_locked(primary_id)
+            secondary_records = self._list_records_locked(secondary_id)
+            moved, conflicts = self._dedupe_records(primary_records, secondary_records)
+            moved_ids = [r["id"] for r in moved]
+            if moved_ids:
+                placeholders = ",".join("?" for _ in moved_ids)
+                self.conn.execute(
+                    f"UPDATE records SET item_id=? WHERE id IN ({placeholders})",
+                    [primary_id] + moved_ids,
+                )
+            self.conn.execute(
+                "UPDATE items SET version=version+1, updated_at=? WHERE id=?",
+                (now, primary_id),
+            )
+            self.conn.execute(
+                "UPDATE items SET version=version+1, updated_at=? WHERE id=?",
+                (now, secondary_id),
+            )
+            moved_json = json.dumps(moved_ids)
+            conflicts_json = json.dumps(conflicts, ensure_ascii=False)
+            try:
+                self.conn.execute(
+                    """INSERT INTO merges(primary_id, secondary_id, primary_version,
+                       secondary_version, moved_records, conflict_records, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (primary_id, secondary_id, primary_version, secondary_version,
+                     moved_json, conflicts_json, actor, now),
+                )
+            except sqlite3.IntegrityError:
+                return self._get_merge_locked(primary_id, secondary_id), False
+            self._append_audit_in_tx("merge", ENTITY, primary_id, actor, {
+                "secondary_id": secondary_id,
+                "moved_records": moved_ids,
+                "conflict_records": conflicts,
+                "primary_version": primary_version,
+                "secondary_version": secondary_version,
+            })
+            merge = self._get_merge_locked(primary_id, secondary_id)
+        return merge, True
+
+    def get_merge(self, primary_id: int, secondary_id: int) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM merges WHERE primary_id=? AND secondary_id=?",
+                (primary_id, secondary_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._merge_row(row)
+
+    def list_merges(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self.conn.execute("SELECT * FROM merges ORDER BY id").fetchall()
+        return [self._merge_row(row) for row in rows]
+
+    def merge_info_map(self, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+        if not item_ids:
+            return {}
+        with self._lock:
+            placeholders = ",".join("?" for _ in item_ids)
+            rows = self.conn.execute(
+                f"""SELECT primary_id, secondary_id FROM merges
+                    WHERE primary_id IN ({placeholders}) OR secondary_id IN ({placeholders})""",
+                list(item_ids) + list(item_ids),
+            ).fetchall()
+        info: Dict[int, Dict[str, Any]] = {i: {} for i in item_ids}
+        for row in rows:
+            pid, sid = row["primary_id"], row["secondary_id"]
+            if pid in info:
+                info[pid].setdefault("merged_from", []).append(sid)
+            if sid in info:
+                info[sid]["merged_into"] = pid
+        return info
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

@@ -4,8 +4,8 @@ from typing import Any, Dict, Optional
 
 from .domain import ensure_role, normalize_severity, require_number, require_text
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, MERGE_ROLES, RECORD_ROLES,
+                    TITLE, VIEW_ROLES, completion_blockers, escalation_required,
                     priority_score, response_deadline_hours, role_for_transition,
                     validate_transition)
 
@@ -77,11 +77,16 @@ class Service:
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
-        return self.enrich(self.repository.get_item(item_id))
+        item = self.repository.get_item(item_id)
+        merge_info = self.repository.merge_info_map([item_id]).get(item_id, {})
+        return self.enrich(item, merge_info)
 
     def list_items(self, role: str, status: Optional[str] = None) -> list:
         self._view(role)
-        return [self.enrich(item) for item in self.repository.list_items(status)]
+        items = self.repository.list_items(status)
+        ids = [item["id"] for item in items]
+        infos = self.repository.merge_info_map(ids)
+        return [self.enrich(item, infos.get(item["id"], {})) for item in items]
 
     def list_records(self, item_id: int, role: str) -> list:
         self._view(role)
@@ -91,8 +96,33 @@ class Service:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
+    def list_merges(self, role: str) -> list:
+        self._view(role)
+        return self.repository.list_merges()
+
     @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def _require_positive_int(value: Any, field: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValidationError(f"{field}必须是正整数")
+        return value
+
+    def merge(self, payload: Dict[str, Any], actor: str, role: str) -> Dict[str, Any]:
+        ensure_role(role, MERGE_ROLES)
+        actor = require_text(actor, "actor", 100)
+        primary_id = self._require_positive_int(payload.get("primary_id"), "primary_id")
+        secondary_id = self._require_positive_int(payload.get("secondary_id"), "secondary_id")
+        primary_version = self._require_positive_int(
+            payload.get("primary_version"), "primary_version")
+        secondary_version = self._require_positive_int(
+            payload.get("secondary_version"), "secondary_version")
+        if primary_id == secondary_id:
+            from .domain import ValidationError
+            raise ValidationError("主事件和从属事件不能相同")
+        merge, _created = self.repository.merge_items(
+            primary_id, secondary_id, primary_version, secondary_version, actor)
+        return merge
+
+    def enrich(self, item: Dict[str, Any], merge_info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         result = dict(item)
         result["priority"] = priority_score(
             item["severity"], item["quantity"], item["threshold"])
@@ -100,4 +130,6 @@ class Service:
             item["severity"], item["quantity"], item["threshold"])
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        if merge_info:
+            result.update(merge_info)
         return result
